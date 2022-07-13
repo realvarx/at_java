@@ -178,6 +178,8 @@ public abstract class Keys {
             if (sharedKeyStatus != null) s += ":sharedKeyStatus:" + sharedKeyStatus;
             if (sharedKeyEnc != null) s += ":sharedKeyEnc:" + sharedKeyEnc;
             if (pubKeyCS != null) s += ":pubKeyCS:" + pubKeyCS;
+            if (isBinary != null) s += ":isBinary:" + isBinary;
+            if (isEncrypted != null) s += ":isEncrypted:" + isEncrypted;
             return s;
         }
 
