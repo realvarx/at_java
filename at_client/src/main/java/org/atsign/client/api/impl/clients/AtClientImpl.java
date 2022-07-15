@@ -19,11 +19,21 @@ import org.atsign.client.util.KeyStringUtil;
 import org.atsign.client.util.KeysUtil;
 import org.atsign.client.util.KeyStringUtil.KeyType;
 
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
+import java.security.SignatureException;
+import java.security.spec.InvalidKeySpecException;
 import java.text.ParseException;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
 
 /**
  * @see org.atsign.client.api.AtClient
@@ -395,18 +405,100 @@ public class AtClientImpl implements AtClient {
         }
     }
 
-    private String _get(SelfKey key) throws AtException {throw new RuntimeException("Not Implemented");}
-    private String _put(SelfKey publicKey, String value) {
-        throw new RuntimeException("Not Implemented");
-    }
-    private String _delete(SelfKey key) {
-        throw new RuntimeException("Not Implemented");
+    private String _get(SelfKey key) throws AtException {
+        String command = "llookup:" + key;
+        Secondary.Response rawResponse = secondary.executeCommand(command, false);
+        if (rawResponse.isError) {
+            throw new AtException("Failed to " + command + " : " + rawResponse.error);
+        }
+
+        String decrypted = null;
+        try {
+            String selfEncryptionKey = keys.get(KeysUtil.selfEncryptionKeyName);
+            decrypted = EncryptionUtil.aesDecryptFromBase64(rawResponse.data, selfEncryptionKey);
+        } catch (NoSuchPaddingException | NoSuchAlgorithmException | InvalidAlgorithmParameterException | InvalidKeyException | IllegalBlockSizeException | BadPaddingException | NoSuchProviderException e) {
+            throw new AtException("Failed to " + "decrypt value with self encryption key" + " : " + e.getMessage(), e);
+        }
+
+        return decrypted;
     }
 
-    private String _get(PublicKey key) throws AtException {throw new RuntimeException("Not Implemented");}
-    private String _put(PublicKey publicKey, String value) {throw new RuntimeException("Not Implemented");}
-    private String _delete(PublicKey key) {
-        throw new RuntimeException("Not Implemented");
+    private String _put(SelfKey selfKey, String value) throws AtException {
+        // sign dataSignature
+        selfKey.metadata.dataSignature = generateSignature(value);
+
+        // encrypt data with self encryption key
+        String cipherText;
+        try {
+            cipherText = EncryptionUtil.aesEncryptToBase64(value, keys.get(KeysUtil.selfEncryptionKeyName));        
+        } catch (NoSuchPaddingException | NoSuchAlgorithmException | InvalidAlgorithmParameterException | InvalidKeyException | IllegalBlockSizeException | BadPaddingException | NoSuchProviderException e) {
+            throw new AtException("Failed to encrypt value with self encryption key : " + e.getMessage(), e);
+        }
+
+        // update secondary
+        String command = "update" + selfKey.metadata.toString() + ":" + selfKey.toString() + " " + cipherText;
+        Secondary.Response response = secondary.executeCommand(command, true);
+        if(response.isError) {
+            throw new AtException("Failed to update " + selfKey + " : " + response.error);
+        }
+        return response.toString();
+    }
+
+    private String _delete(SelfKey key) throws AtException {
+        String command = "delete:" + key.toString();
+        Secondary.Response response = secondary.executeCommand(command, true);
+        if(response.isError) {
+            throw new AtException("Failed to run command " + command + " : " + response.error);
+        }
+        return response.toString();
+    }
+
+    private String _get(PublicKey key) throws AtException {
+        // 2 scenarios
+        // 1. look in own secondary server (including cached)
+        // 2. look in another secondary server (via plookup)
+
+        Secondary.Response rawResponse = null;
+        
+        // 1. look in own secondary
+        String command = "llookup:" + key.toString();
+        rawResponse = secondary.executeCommand(command, false);
+        if(rawResponse.isError) {
+            // try cached
+            command = "llookup:cached:" + key.toString();
+            rawResponse = secondary.executeCommand(command, false);
+            if(rawResponse.isError) {
+                // 2. try plookup
+                command = "plookup:" + key.toString().replace("public:", "");
+                rawResponse = secondary.executeCommand(command, false);
+                if(rawResponse.isError) {
+                    throw new AtException("Failed to " + command + " : " + rawResponse.error);
+                }
+            }
+        }
+        return rawResponse.data;
+    }
+    
+    private String _put(PublicKey publicKey, String value) throws AtException {
+        // sign data
+        publicKey.metadata.dataSignature = generateSignature(value);
+        
+        // update
+        String command = "update" + publicKey.metadata.toString() + ":" + publicKey.toString() + " " + value;
+        Secondary.Response rawResponse = secondary.executeCommand(command, false);
+        if(rawResponse.isError) {
+            throw new AtException(rawResponse.error);
+        }
+        return rawResponse.toString();
+    }
+
+    private String _delete(PublicKey key) throws AtException {
+        String command = "delete:" + key.toString();
+        Secondary.Response rawResponse = secondary.executeCommand(command, false);
+        if(rawResponse.isError) {
+            throw new AtException(rawResponse.error);
+        }
+        return rawResponse.toString();
     }
 
     private byte[] _getBinary(SharedKey sharedKey) throws AtException {throw new RuntimeException("Not Implemented");}
@@ -424,7 +516,7 @@ public class AtClientImpl implements AtClient {
         List<AtKey> atKeys = new ArrayList<AtKey>(); 
         for(String atKeyRaw : rawArray) { // eg atKeyRaw == @bob:phone@alice
             AtKey atKey = Keys.fromString(atKeyRaw);
-            Secondary.Response llookupMetaRaw = executeCommand("llookup:meta:" + atKeyRaw, false);
+            Secondary.Response llookupMetaRaw = secondary.executeCommand("llookup:meta:" + atKeyRaw, false);
             atKey.metadata = Metadata.squash(atKey.metadata, Metadata.fromString(llookupMetaRaw)); // atKey.metadata has priority over llookupMetaRaw.data
             atKeys.add(atKey);
         }
@@ -565,5 +657,15 @@ public class AtClientImpl implements AtClient {
         } else {
             return rawResponse.data;
         }
+    }
+
+    private String generateSignature(String value) throws AtException {
+        String signature = null;
+        try {
+            signature = EncryptionUtil.signSHA256RSA(value, keys.get(KeysUtil.pkamPrivateKeyName));
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException | NoSuchPaddingException | InvalidKeyException | IllegalBlockSizeException | BadPaddingException | SignatureException e) {
+            throw new AtException("Failed to sign value: " + value);
+        }
+        return signature;
     }
 }
