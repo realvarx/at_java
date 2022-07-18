@@ -9,6 +9,7 @@ import org.atsign.common.AtSign;
 import org.atsign.common.KeyBuilders;
 import org.atsign.common.Keys;
 import org.atsign.common.ResponseTransformers;
+import org.atsign.common.ResponseTransformers.LlookupMetadataResponseTransformer;
 import org.atsign.common.ResponseTransformers.ScanResponseTransformer;
 
 import static org.atsign.common.Keys.*;
@@ -462,20 +463,33 @@ public class AtClientImpl implements AtClient {
         
         // 1. look in own secondary
         String command = "llookup:" + key.toString();
+        String metaCommand = "llookup:meta:" + key.toString();
         rawResponse = secondary.executeCommand(command, false);
         if(rawResponse.isError) {
             // try cached
             command = "llookup:cached:" + key.toString();
+            metaCommand = "llookup:meta:cached:" + key.toString();
             rawResponse = secondary.executeCommand(command, false);
             if(rawResponse.isError) {
                 // 2. try plookup
                 command = "plookup:" + key.toString().replace("public:", "");
+                metaCommand = "plookup:meta:" + key.toString().replace("public:", "");
                 rawResponse = secondary.executeCommand(command, false);
                 if(rawResponse.isError) {
                     throw new AtException("Failed to " + command + " : " + rawResponse.error);
                 }
             }
         }
+        // low priority - update AtKey metadata with squash, if any error happens, then this is not a problem, just missing metadata
+        Secondary.Response rawResponseMeta = secondary.executeCommand(metaCommand, false);
+        if(!rawResponseMeta.isError) {
+            try {
+                key.metadata = Metadata.squash(key.metadata, Metadata.fromString(rawResponseMeta));
+            } catch (ParseException e) {
+                // ignore
+            }
+        }
+
         return rawResponse.data;
     }
     
